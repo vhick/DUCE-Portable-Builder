@@ -1,0 +1,152 @@
+name: Build DUCE Portable (Manual)
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: "latest (recommended) or an upstream tag / branch / commit"
+        required: true
+        default: latest
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Windows 64-bit portable ZIP
+    runs-on: windows-2022
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      PYTHONIOENCODING: utf-8
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - name: Check out portable-builder files
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11 x64
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          architecture: x64
+
+      - name: Fetch latest stable upstream source (or selected ref)
+        env:
+          UPSTREAM_REF: ${{ inputs.upstream_ref }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ref = $env:UPSTREAM_REF.Trim()
+          if ($ref -eq 'latest') {
+            # Do not silently switch to a development branch on API failure.
+            $headers = @{
+              'User-Agent' = 'DUCE-Portable-Builder'
+              'Accept' = 'application/vnd.github+json'
+              'Authorization' = "Bearer $env:GH_TOKEN"
+            }
+            $release = Invoke-RestMethod -Headers $headers -Uri 'https://api.github.com/repos/techtanic/Discounted-Udemy-Course-Enroller/releases/latest' -TimeoutSec 30
+            if (-not $release.tag_name) { throw 'No stable release tag provided; choose an exact tag explicitly.' }
+            $ref = $release.tag_name
+            Write-Host "Official latest stable release: $ref"
+          }
+          git clone --quiet --no-checkout --filter=blob:none https://github.com/techtanic/Discounted-Udemy-Course-Enroller.git upstream
+          if ($LASTEXITCODE -ne 0) { throw 'Could not clone upstream repository' }
+          git -C upstream fetch --quiet --depth 1 origin $ref
+          if ($LASTEXITCODE -ne 0) { throw "Could not fetch upstream ref: $ref" }
+          git -C upstream checkout --quiet --detach FETCH_HEAD
+          if ($LASTEXITCODE -ne 0) { throw 'Could not check out upstream source' }
+          $commit = (git -C upstream rev-parse HEAD).Trim()
+          Write-Host "UPSTREAM COMMIT: $commit"
+          if (-not (Test-Path upstream\extra\DUCE-LOGO.ico)) { throw 'Original upstream icon is missing' }
+          if (-not (Test-Path upstream\gui.py)) { throw 'Upstream GUI source is missing' }
+          if (-not (Test-Path upstream\cli.py)) { throw 'Upstream CLI source is missing' }
+          "source_ref=$ref`nsource_commit=$commit" | Out-File -Append -Encoding utf8 $env:GITHUB_OUTPUT
+
+      - name: Patch and verify portable data paths
+        run: |
+          python scripts/patch_source.py upstream/base.py
+          if ($LASTEXITCODE -ne 0) { throw 'Portable patch failed' }
+          python -m py_compile upstream/base.py upstream/gui.py upstream/cli.py
+          if ($LASTEXITCODE -ne 0) { throw 'Upstream compilation failed' }
+          python scripts/verify_source.py upstream
+          if ($LASTEXITCODE -ne 0) { throw 'Source portability check failed' }
+
+      - name: Install the official application dependencies and builder tools
+        run: |
+          python -m pip install --upgrade pip
+          if ($LASTEXITCODE -ne 0) { throw 'pip upgrade failed' }
+          python -m pip install -r upstream/requirements.txt "pyinstaller==6.16.0" "pillow==11.3.0"
+          if ($LASTEXITCODE -ne 0) { throw 'Python dependency installation failed' }
+
+      - name: Build the patched GUI in onedir mode
+        run: |
+          $ico = (Resolve-Path upstream/extra/DUCE-LOGO.ico).Path
+          $settings = (Resolve-Path upstream/default-duce-gui-settings.json).Path
+          $license = (Resolve-Path upstream/LICENSE).Path
+          $entry = (Resolve-Path upstream/gui.py).Path
+          python -m PyInstaller --noconfirm --clean --onedir --windowed --name DUCE-GUI --icon "$ico" --distpath dist --workpath work/gui --specpath work/spec `
+            --add-data "${settings};." `
+            --add-data "${license};." `
+            "$entry"
+          if ($LASTEXITCODE -ne 0) { throw 'DUCE GUI build failed' }
+
+      - name: Build the patched CLI in onedir mode
+        run: |
+          $ico = (Resolve-Path upstream/extra/DUCE-LOGO.ico).Path
+          $settings = (Resolve-Path upstream/default-duce-cli-settings.json).Path
+          $license = (Resolve-Path upstream/LICENSE).Path
+          $entry = (Resolve-Path upstream/cli.py).Path
+          python -m PyInstaller --noconfirm --clean --onedir --console --name DUCE-CLI --icon "$ico" --distpath dist --workpath work/cli --specpath work/spec `
+            --add-data "${settings};." `
+            --add-data "${license};." `
+            "$entry"
+          if ($LASTEXITCODE -ne 0) { throw 'DUCE CLI build failed' }
+
+      - name: Package full PortableApps-style folder
+        run: |
+          python scripts/package_portable.py --source upstream --dist dist --stage stage
+          if ($LASTEXITCODE -ne 0) { throw 'Staging failed' }
+
+      - name: Compile native Windows GUI launcher with original icon
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $csc = "$env:WINDIR\Microsoft.NET\Framework\v4.0.30319\csc.exe"
+          if (!(Test-Path $csc)) { throw '.NET Framework C# compiler is unavailable' }
+          & $csc /nologo /target:winexe /platform:anycpu /optimize+ /r:System.Windows.Forms.dll `
+            /win32icon:upstream\extra\DUCE-LOGO.ico /out:stage\DUCEPortable\DUCEPortable.exe launcher\DUCEPortable.cs
+          if ($LASTEXITCODE -ne 0) { throw 'Native launcher compilation failed' }
+
+      - name: Verify the packaged files and safe portable startup
+        run: |
+          python scripts/verify_package.py stage/DUCEPortable
+          if ($LASTEXITCODE -ne 0) { throw 'Package verification failed' }
+          & .\stage\DUCEPortable\DUCEPortable.exe --self-test
+          if ($LASTEXITCODE -ne 0) { throw 'Launcher self-test failed' }
+          if (!(Test-Path stage\DUCEPortable\Data\LauncherLogs\self-test.txt)) { throw 'Self-test did not write inside Data' }
+          # Erase only test-created output in staging, so the distributed Data is empty.
+          Remove-Item -Force stage\DUCEPortable\Data\LauncherLogs\self-test.txt
+          Remove-Item -Recurse -Force stage\DUCEPortable\Data\LauncherLogs
+          Remove-Item -Recurse -Force stage\DUCEPortable\Data\Temp
+          Remove-Item -Recurse -Force stage\DUCEPortable\Data\Cache
+          Write-Host 'PASS: root launcher starts and can write inside Data.'
+
+      - name: Create one portable application ZIP (including parent folder)
+        run: |
+          New-Item -ItemType Directory -Force output | Out-Null
+          $releaseName = (Get-Content stage\release-name.txt -Raw).Trim()
+          Compress-Archive -Path stage\DUCEPortable -DestinationPath (Join-Path output $releaseName) -CompressionLevel Optimal
+          $zip = Join-Path output $releaseName
+          if (!(Test-Path $zip)) { throw 'Final ZIP not produced' }
+          Get-FileHash -Algorithm SHA256 $zip | Format-List
+          Write-Host "PORTABLE APPLICATION ZIP: $zip"
+
+      - name: Upload portable application ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: DUCE-Portable-Windows-x64
+          path: output/*.zip
+          if-no-files-found: error
+          retention-days: 1

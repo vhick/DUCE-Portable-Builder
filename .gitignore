@@ -1,0 +1,8 @@
+upstream/
+dist/
+work/
+stage/
+output/
+__pycache__/
+*.pyc
+.venv/
